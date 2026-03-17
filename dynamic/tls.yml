@@ -4,12 +4,31 @@ tls:
       keyFile: /certs/localhost-key.pem
 
 http:
+  middlewares:
+    kwh-cors:
+      headers:
+        accessControlAllowOriginList:
+          - https://kwh.localtest.me
+          - https://api-kwh.localtest.me
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - Content-Type
+          - Authorization
+        addVaryHeader: true
+
   routers:
     kwh-router:
       rule: "Host(`kwh.localtest.me`)"
       entryPoints:
         - websecure
       tls: {}
+      middlewares:
+        - kwh-cors
       service: kwh-svc
     
     kwh-api-router:
@@ -17,6 +36,8 @@ http:
       entryPoints:
         - websecure
       tls: {}
+      middlewares:
+        - kwh-cors
       service: kwh-api-svc
 
   services:
