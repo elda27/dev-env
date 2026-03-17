@@ -1,0 +1,19 @@
+tls:
+  certificates:
+    - certFile: /certs/localhost.pem
+      keyFile: /certs/localhost-key.pem
+
+http:
+  routers:
+    legacy:
+      rule: "Host(`kwh.localtest.me`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kwh-svc
+
+  services:
+    kwh-svc:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:3200"

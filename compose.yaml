@@ -1,0 +1,455 @@
+x-common-params: &common-params
+  environment:
+    TZ: Asia/Tokyo
+    LANG: ja_JP.UTF-8
+  restart: unless-stopped
+
+services:
+  # ===================
+  # Traefik
+  # ===================
+  web:
+    <<: *common-params
+    image: traefik
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      # - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --api=true
+
+    ports:
+      # - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/certs:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`traefik.localtest.me`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls=true
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.middlewares=keycloak-auth@docker
+      # - traefik.http.routers.dashboard.middlewares=auth
+      - traefik.http.middlewares.auth.basicauth.users=test:$$apr1$$H6uskkkW$$IgXLP6ewTrSuBkTrqE8wj/,test2:$$apr1$$d9hr9HBB$$4HxwgUir3HP4EsggP/QNo0
+    networks:
+      local:
+        aliases:
+          - keycloak.localtest.me
+  # ===================
+  # Keycloak
+  # ===================
+  keycloak:
+    <<: *common-params
+    image: quay.io/keycloak/keycloak:latest
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME_URL: https://keycloak.localtest.me
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HOSTNAME: keycloak.localtest.me
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.keycloak.rule=Host(`keycloak.localtest.me`)
+      - traefik.http.routers.keycloak.entrypoints=websecure
+      - traefik.http.routers.keycloak.tls=true
+      - traefik.http.services.keycloak.loadbalancer.server.port=8080
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    networks:
+      - local
+      - keycloak
+
+  keycloak-terraform:
+    <<: *common-params
+    image: hashicorp/terraform:1.11.4
+    restart: "no"
+    working_dir: /workspace/terraform/keycloak
+    entrypoint:
+      - /bin/sh
+      - /scripts/keycloak_terraform_apply.sh
+    volumes:
+      - ./scripts/keycloak_terraform_apply.sh:/scripts/keycloak_terraform_apply.sh:ro
+      - ./terraform:/workspace/terraform
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_CLIENT_ID: admin-cli
+      KEYCLOAK_USER: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KEYCLOAK_REALM: master
+      TF_VAR_realm_name: ${KEYCLOAK_REALM:-default}
+      TF_VAR_forward_auth_client_id: ${KEYCLOAK_FORWARD_AUTH_CLIENT_ID:-traefik-forward-auth}
+      TF_VAR_forward_auth_client_secret: ${KEYCLOAK_FORWARD_AUTH_CLIENT_SECRET}
+      TF_VAR_forward_auth_client_secret_version: ${KEYCLOAK_FORWARD_AUTH_CLIENT_SECRET_VERSION:-1}
+      TF_VAR_forward_auth_root_url: https://auth.localtest.me
+      TF_VAR_forward_auth_redirect_uri: https://auth.localtest.me/_oauth
+    depends_on:
+      - keycloak
+    networks:
+      - keycloak
+
+  # ===================
+  # Traefik Forward Auth
+  # ===================
+  traefik-forward-auth:
+    <<: *common-params
+    image: thomseddon/traefik-forward-auth:2
+    # Distroless images may not include /bin/sh; use Go TLS env vars instead.
+    volumes:
+      - ./certs/ca/rootCA.pem:/certs/root-ca.pem:ro
+    environment:
+      SSL_CERT_FILE: /certs/root-ca.pem
+      DEFAULT_PROVIDER: oidc
+      PROVIDERS_OIDC_ISSUER_URL: https://keycloak.localtest.me/realms/${KEYCLOAK_REALM:-default}
+      PROVIDERS_OIDC_CLIENT_ID: ${KEYCLOAK_FORWARD_AUTH_CLIENT_ID:-traefik-forward-auth}
+      PROVIDERS_OIDC_CLIENT_SECRET: ${KEYCLOAK_FORWARD_AUTH_CLIENT_SECRET}
+      SECRET: ${FORWARD_AUTH_SECRET}
+      AUTH_HOST: auth.localtest.me
+      COOKIE_DOMAIN: localtest.me
+      INSECURE_COOKIE: "false"
+      URL_PATH: /_oauth
+      LOG_LEVEL: debug
+    labels:
+      - traefik.enable=true
+      # Router for the auth callback host
+      - traefik.http.routers.forward-auth.rule=Host(`auth.localtest.me`)
+      - traefik.http.routers.forward-auth.entrypoints=websecure
+      - traefik.http.routers.forward-auth.tls=true
+      - traefik.http.services.forward-auth.loadbalancer.server.port=4181
+      # Middleware definition (apply "keycloak-auth@docker" to protect other services)
+      - traefik.http.middlewares.keycloak-auth.forwardauth.address=http://traefik-forward-auth:4181
+      - traefik.http.middlewares.keycloak-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.keycloak-auth.forwardauth.trustForwardHeader=true
+    depends_on:
+      keycloak:
+        condition: service_started
+      keycloak-terraform:
+        condition: service_completed_successfully
+    networks:
+      - local
+      - keycloak
+
+  keycloak-db:
+    <<: *common-params
+    image: postgres:18-bookworm
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - keycloak
+
+  # ===================
+  # RustFS and Storage
+  # ===================
+  
+  rustfs:
+    <<: *common-params
+    image: rustfs/rustfs:latest
+    #ports:
+    #  - '9000:9000'
+    #  - '9001:9001'
+    environment:
+      RUSTFS_ROOT_USER: ${RUSTFS_ROOT_USER}
+      RUSTFS_ROOT_PASSWORD: ${RUSTFS_ROOT_PASSWORD}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    command: >
+      --address :9000
+      --console-enable
+      --access-key rustfsadmin
+      --secret-key rustfsadmin
+      /data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 2s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - rustfs-data:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.rustfs.rule=Host(`api.rustfs.localtest.me`)
+      - traefik.http.routers.rustfs.entrypoints=websecure
+      - traefik.http.routers.rustfs.tls=true
+      - traefik.http.routers.rustfs.middlewares=keycloak-auth@docker
+      - traefik.http.services.rustfs.loadbalancer.server.port=9000
+      - traefik.http.routers.api_rustfs.rule=Host(`rustfs.localtest.me`)
+      - traefik.http.routers.api_rustfs.entrypoints=websecure
+      - traefik.http.routers.api_rustfs.tls=true
+      - traefik.http.routers.api_rustfs.middlewares=keycloak-auth@docker
+      - traefik.http.services.api_rustfs.loadbalancer.server.port=9001
+  
+  # ===================
+  # ClickHouse
+  # ===================
+  clickhouse:
+    <<: *common-params
+    image: clickhouse/clickhouse-server:latest
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8123/ping" ]
+      interval: 2s
+      timeout: 10s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.clickhouse.rule=Host(`api.clickhouse.localtest.me`)
+      - traefik.http.routers.clickhouse.entrypoints=websecure
+      - traefik.http.routers.clickhouse.tls=true
+      - traefik.http.routers.clickhouse.middlewares=keycloak-auth@docker
+      - traefik.http.services.clickhouse.loadbalancer.server.port=8123
+      # Web UI
+      - traefik.http.routers.ui-clickhouse.rule=Host(`ui-clickhouse.localtest.me`)
+      - traefik.http.middlewares.ui-clickhouse-strip.stripprefix.prefixes=/play
+      - traefik.http.routers.ui-clickhouse.middlewares=ui-clickhouse-strip,keycloak-auth@docker
+      - traefik.http.services.ui-clickhouse.loadbalancer.server.port=8123
+      - traefik.http.routers.ui-clickhouse.entrypoints=websecure
+  
+  # ===================
+  # Kestra
+  # ===================
+
+  kestra-db:
+    image: postgres:18-bookworm
+    volumes:
+      - kestra-db-data:/var/lib/postgresql/
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${KESTRA_DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    networks:
+      - kestra
+  kestra-scheduler:
+    image: kestra/kestra:latest
+    deploy:
+      replicas: 2
+    pull_policy: if_not_present
+    user: "root"
+    command: server scheduler
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      KESTRA_CONFIGURATION: &common_configuration |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra-db:5432/kestra
+            driver-class-name: org.postgresql.Driver
+            username: kestra
+            password: ${KESTRA_DB_PASSWORD}
+        kestra:
+          server:
+            basic-auth:
+              username: "admin@kestra.io"
+              password: ${KESTRA_DB_PASSWORD}
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+    # ports:
+    #   - "8082-8083:8081"
+    depends_on:
+      kestra-db:
+        condition: service_started
+    networks:
+      - kestra
+  kestra-worker:
+    image: kestra/kestra:latest
+    deploy:
+      replicas: 2
+    pull_policy: if_not_present
+    user: "root"
+    command: server worker
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      KESTRA_CONFIGURATION: *common_configuration
+    # ports:
+    #   - "8084-8085:8081"
+    depends_on:
+      kestra-db:
+        condition: service_started
+    networks:
+      - kestra
+  kestra-executor:
+    image: kestra/kestra:latest
+    deploy:
+      replicas: 2
+    pull_policy: if_not_present
+    user: "root"
+    command: server executor
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      KESTRA_CONFIGURATION: *common_configuration
+    # ports:
+    #   - "8086-8087:8081"
+    depends_on:
+      kestra-db:
+        condition: service_started
+    networks:
+      - kestra
+  kestra-webserver:
+    image: kestra/kestra:latest
+    deploy:
+      replicas: 1
+    pull_policy: if_not_present
+    user: "root"
+    command: server webserver
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      KESTRA_CONFIGURATION: *common_configuration
+      KESTRA_URL: https://kestra.localtest.me/
+    # ports:
+    #   - "8080:8080"
+    #   - "8081:8081"
+    depends_on:
+      kestra-db:
+        condition: service_started
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kestra.rule=Host(`kestra.localtest.me`)
+      - traefik.http.routers.kestra.entrypoints=websecure
+      - traefik.http.routers.kestra.tls=true
+      - traefik.http.routers.kestra.middlewares=keycloak-auth@docker
+      - traefik.http.services.kestra.loadbalancer.server.port=8080
+  # ===================
+  # Linkding
+  # ===================
+  linkding:
+    <<: *common-params
+    image: sissbruecker/linkding:latest
+    volumes:
+      - linkding-data:/etc/linkding/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.linkding.rule=Host(`linkding.localtest.me`)
+      - traefik.http.routers.linkding.entrypoints=websecure
+      - traefik.http.routers.linkding.tls=true
+      - traefik.http.routers.linkding.middlewares=keycloak-auth@docker
+      - traefik.http.services.linkding.loadbalancer.server.port=9090
+    networks:
+      - local
+
+  # ===================
+  # Backstage
+  # ===================
+  # backstage-db:
+  #   <<: *common-params
+  #   image: postgres:18-bookworm
+  #   environment:
+  #     POSTGRES_DB: backstage
+  #     POSTGRES_USER: backstage
+  #     POSTGRES_PASSWORD: ${BACKSTAGE_DB_PASSWORD}
+  #   volumes:
+  #     - backstage-db-data:/var/lib/postgresql/
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U backstage"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - backstage
+
+  # backstage:
+  #   <<: *common-params
+  #   image: backstage/backstage:latest
+  #   environment:
+  #     POSTGRES_HOST: backstage-db
+  #     POSTGRES_PORT: 5432
+  #     POSTGRES_USER: backstage
+  #     POSTGRES_PASSWORD: ${BACKSTAGE_DB_PASSWORD}
+  #   depends_on:
+  #     backstage-db:
+  #       condition: service_healthy
+  #   labels:
+  #     - traefik.enable=true
+  #     - traefik.http.routers.backstage.rule=Host(`backstage.localtest.me`)
+  #     - traefik.http.routers.backstage.entrypoints=websecure
+  #     - traefik.http.routers.backstage.tls=true
+  #     - traefik.http.services.backstage.loadbalancer.server.port=7007
+  #   networks:
+  #     - local
+  #     - backstage
+
+networks:
+  local:
+    external: true
+  keycloak:
+    driver: bridge
+  temporal:
+    driver: bridge
+  kestra:
+    driver: bridge
+  # backstage:
+  #   driver: bridge
+volumes:
+  keycloak-db-data:
+    # external: true
+    name: infra-keycloak-db
+  rustfs-data:
+    # external: true
+    name: infra-rustfs-data
+  temporal-db-data:
+    # external: true
+    name: infra-temporal-db
+  kestra-db-data:
+    # external: true
+    name: infra-kestra-db
+  kestra-data:
+    # external: true
+    name: infra-kestra-data
+  # backstage-db-data:
+  #   external: true
+  #   name: infra-backstage-db
+  clickhouse-data:
+    # external: true
+    name: infra-clickhouse-data
+  linkding-data:
+    # external: true
+    name: infra-linkding-data
