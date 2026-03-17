@@ -5,15 +5,27 @@ tls:
 
 http:
   routers:
-    legacy:
+    kwh-router:
       rule: "Host(`kwh.localtest.me`)"
       entryPoints:
         - websecure
       tls: {}
       service: kwh-svc
+    
+    kwh-api-router:
+      rule: "Host(`api-kwh.localtest.me`)"
+      entryPoints:
+        - websecure
+      tls: {}
+      service: kwh-api-svc
 
   services:
     kwh-svc:
       loadBalancer:
         servers:
           - url: "http://host.docker.internal:3200"
+
+    kwh-api-svc:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8001"

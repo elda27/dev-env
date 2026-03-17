@@ -126,6 +126,14 @@ services:
       LOG_LEVEL: debug
     labels:
       - traefik.enable=true
+      # Route the callback through the forward-auth middleware so Traefik includes
+      # the forwarded callback URI that traefik-forward-auth expects in auth-host mode.
+      - traefik.http.routers.forward-auth-callback.rule=Host(`auth.localtest.me`) && PathPrefix(`/_oauth`)
+      - traefik.http.routers.forward-auth-callback.entrypoints=websecure
+      - traefik.http.routers.forward-auth-callback.tls=true
+      - traefik.http.routers.forward-auth-callback.priority=100
+      - traefik.http.routers.forward-auth-callback.middlewares=keycloak-auth@docker
+      - traefik.http.routers.forward-auth-callback.service=forward-auth
       # Router for the auth callback host
       - traefik.http.routers.forward-auth.rule=Host(`auth.localtest.me`)
       - traefik.http.routers.forward-auth.entrypoints=websecure
